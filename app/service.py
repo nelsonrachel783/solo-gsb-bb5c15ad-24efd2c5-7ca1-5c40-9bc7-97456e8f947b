@@ -88,6 +88,81 @@ def batch_composition(conn: sqlite3.Connection, batch_id: int) -> Composition:
     return _expand(kinds, recipes, batch_id, {})
 
 
+def exclusion_impact_preview(
+    conn: sqlite3.Connection, sample_a: int, sample_b: int
+) -> tuple[int, int, list[tuple[int, bool, list[int]]]]:
+    """禁配补录影响预演：沿现有批次配方 DAG 计算两个原始样本的可达性。
+
+    返回 (low_id, high_id, [(受影响批次 id, 是否首次合流, 可追溯首次合流批次 id 列表)])：
+    - 受影响批次 = 沿配方图可达原始样本中同时含两样本的混样批次，按 id 升序、各一次；
+    - 首次合流 = 自身同时含两样本、但每个直接原料都不同时含两样本的批次；
+    - 可追溯首次合流：沿配方边向上追溯，自身为首次合流时含自身，否则为各原料
+      追溯结果的并集；嵌套与多路径汇合经 memo + 集合并去重，不漏报不重复。
+    全程只读：不登记规则、不改任何配方。
+    """
+    kinds, recipes = _load_graph(conn)
+    low_id, high_id = sorted((sample_a, sample_b))
+    pair = frozenset({low_id, high_id})
+
+    reach_memo: dict[int, frozenset[int]] = {}
+
+    def reachable(batch_id: int) -> frozenset[int]:
+        """沿配方 DAG 收集批次可达的全部原始样本；多路径汇合只展开一次。"""
+        if batch_id in reach_memo:
+            return reach_memo[batch_id]
+        if kinds[batch_id] == "sample":
+            result: frozenset[int] = frozenset({batch_id})
+        else:
+            result = frozenset().union(
+                *(reachable(ingredient_id) for ingredient_id, _ in recipes.get(batch_id, []))
+            )
+        reach_memo[batch_id] = result
+        return result
+
+    affected = [
+        batch_id
+        for batch_id in sorted(b for b, kind in kinds.items() if kind == "pool")
+        if pair <= reachable(batch_id)
+    ]
+
+    def ingredient_ids(batch_id: int) -> list[int]:
+        return [ingredient_id for ingredient_id, _ in recipes.get(batch_id, [])]
+
+    # 首次合流：直接原料中没有任何一个同时含两样本
+    first_confluence = {
+        batch_id: all(not pair <= reachable(ingredient_id)
+                      for ingredient_id in ingredient_ids(batch_id))
+        for batch_id in affected
+    }
+
+    trace_memo: dict[int, frozenset[int]] = {}
+
+    def trace_first(batch_id: int) -> frozenset[int]:
+        """沿配方边向上追溯全部首次合流批次 id。
+
+        非受影响原料（不同时含两样本，含原始样本自身）追溯结果为空：首次合流
+        只可能出现在“同时含两样本”的子 DAG 上。
+        """
+        if batch_id in trace_memo:
+            return trace_memo[batch_id]
+        # 不含两样本的批次不可能通向首次合流（可达集是原料可达集的并集）
+        if not pair <= reachable(batch_id):
+            result = frozenset()
+        elif first_confluence.get(batch_id):
+            result = frozenset({batch_id})
+        else:
+            result = frozenset().union(
+                *(trace_first(ingredient_id) for ingredient_id in ingredient_ids(batch_id))
+            )
+        trace_memo[batch_id] = result
+        return result
+
+    return low_id, high_id, [
+        (batch_id, first_confluence[batch_id], sorted(trace_first(batch_id)))
+        for batch_id in affected
+    ]
+
+
 def downstream_batches(recipes: Recipes, batch_id: int) -> list[int]:
     """沿配方引用关系找出全部下游批次（含目标自身）。
 

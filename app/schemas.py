@@ -33,6 +33,33 @@ class ExclusionRuleOut(BaseModel):
     created_at: str
 
 
+class ImpactPreviewRequest(BaseModel):
+    """禁配补录影响预演：一对不同的原始样本 id。
+
+    允许该无序对尚未登记为禁配规则；顺序无关，服务端按 id 归一化。预演只读。
+    """
+
+    sample_a_id: StrictPositiveInt
+    sample_b_id: StrictPositiveInt
+
+
+class ImpactPreviewBatchOut(BaseModel):
+    batch_id: int
+    batch_name: BatchName
+    # 首次合流：自身同时含两样本，但每个直接原料都不同时含两样本
+    is_first_confluence: bool
+    # 沿配方 DAG 可追溯到的全部首次合流批次 id（自身为首次合流时含自身）；
+    # 嵌套与多路径汇合不去重不漏报，按 id 升序
+    first_confluence_batch_ids: list[int]
+
+
+class ImpactPreviewOut(BaseModel):
+    # 请求无序对归一后按 id 升序返回
+    low_sample_id: int
+    high_sample_id: int
+    affected_batches: list[ImpactPreviewBatchOut]  # 已同时含两样本的混样批次，按 id 升序、各一次
+
+
 class RecipeItem(BaseModel):
     batch_id: StrictPositiveInt
     portions: StrictPositiveInt
