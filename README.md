@@ -6,6 +6,7 @@
 
 - 登记**原始样本**、按配方创建**混样批次**（配方 = 已有批次 + 各自的正整数投入份数）
 - **原始样本禁配规则**：登记一对不同的原始样本（无序对，重复登记幂等）；创建混样时沿配方图递归展开**嵌套混样与多路径汇合**后的全部可达原始样本，命中任一禁配对即返回 **409**（不创建批次或配方）；规则只约束**随后创建**的批次，已有批次及其占比接口不受影响
+- **禁配补录影响预演**：给定两个原始样本（**无需已登记为禁配对**），沿现有配方 DAG 预演补录禁配的影响——返回已**同时含两样本**的混样批次，把直接原料均未同时含两样本的批次标记为**首次合流**，并为每个受影响批次列出可追溯的首次合流批次 id（含自身、升序去重）；嵌套与多路径汇合不漏报、不重复；**只读**，不登记规则、不改已有配方
 - 创建校验：拒绝**空配方**（422）、**未知批次**（400）、**非正整数份数**（422，含 0、负数、小数、字符串）、**命中禁配规则**（409）
 - 新批次只能引用**已创建**的批次，引用关系天然构成有向无环图，不可能成环
 - 占比追溯：按每层“投入份数 / 该层总份数”递归分摊；同一原始样本经多条路径到达时**自动合并**；基于 `fractions.Fraction` 精确有理数运算，返回**约分后**的分子与分母
@@ -49,6 +50,7 @@ docker compose up --build
 | `POST` | `/samples` | 登记原始样本 |
 | `POST` | `/exclusion-rules` | 登记原始样本禁配对（无序对，重复登记幂等） |
 | `GET` | `/exclusion-rules` | 列出全部禁配规则（按样本对字典序） |
+| `POST` | `/exclusion-rules/impact-preview` | 禁配补录影响预演（只读，不登记规则、不改配方） |
 | `POST` | `/pools` | 创建混样批次（命中禁配返回 409） |
 | `POST` | `/pool-plans` | 按目标占比反算整数份数配方（只规划，不写库） |
 | `GET` | `/batches` | 列出全部批次 |
@@ -302,6 +304,36 @@ curl -X POST http://localhost:8000/batches/4/portion-diagnosis \
 
 校验：`3×P1 + 1×S1` 中 S1 = 3/4×1/2 + 1/4×1 = 5/8，S2 = 3/4×1/2 = 3/8，与实测一致；把 S1 的份数改成任何值都无法得到该组成，故 P1 是唯一可疑项。
 
+### 9. 禁配补录影响预演
+
+`POST /exclusion-rules/impact-preview`（服务地址 `http://localhost:8000`，可在 <http://localhost:8000/docs> 的 Swagger 交互文档中直接试调用）接收两个**不同、已存在的原始样本** id（`sample_a_id`、`sample_b_id`，顺序无关，**无需已登记为禁配对**），沿**现有批次配方 DAG** 分别计算两样本的可达性，预演“若把这对样本补录为禁配”会波及哪些已有批次：
+
+- `affected_batches`：已**同时含有两个样本**的混样批次（含经嵌套混样、多路径间接同时可达），按批次 id **升序**；
+- `first_confluence`：该批次的**直接原料均未同时含两样本**时为 `true`——两样本在此**首次合流**（可能各自经嵌套混样到达）；
+- `first_confluence_batch_ids`：沿配方边向上可追溯到的**全部首次合流批次 id**（若自身是首次合流则含自身），升序且去重——多路径菱形汇合不会重复列出同一首次合流批次。
+
+预演为**只读**操作：不登记规则、不修改任何已有批次与配方；两个 id 相同、引用不存在的批次或引用混样批次（非原始样本）返回 **400**。
+
+准备数据：S1、S2、S3 为原始样本（id 1、2、3），`P1 = 1×S1 + 1×S3`（id 4）、`Q1 = 1×S2 + 1×S3`（id 5）、`P2 = 1×P1 + 1×Q1`（id 6）。P1 只含 S1、Q1 只含 S2，S1 与 S2 在 P2 首次合流：
+
+```bash
+curl -X POST http://localhost:8000/exclusion-rules/impact-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"sample_a_id": 1, "sample_b_id": 2}'
+```
+
+```json
+{
+  "low_sample_id": 1,
+  "high_sample_id": 2,
+  "affected_batches": [
+    {"batch_id": 6, "batch_name": "P2", "first_confluence": true, "first_confluence_batch_ids": [6]}
+  ]
+}
+```
+
+若再创建 `P3 = 1×P2 + 1×S3`（id 7），再次预演：P2、P3 都在 `affected_batches` 中（按 id 升序）；P3 的直接原料 P2 已同时含两样本，故 `first_confluence` 为 `false`，其 `first_confluence_batch_ids` 为 `[6]`。若下游还有一个批次经 P2、P1 两条路径汇合，6 仍只列出一次。若两样本从未在任何批次中同时可达，`affected_batches` 为空列表。
+
 ### 错误示例
 
 ```bash
@@ -353,6 +385,12 @@ curl -X POST http://localhost:8000/batches/3/portion-diagnosis -H 'Content-Type:
 # 份数诊断：目标不是混样批次 → 400
 curl -X POST http://localhost:8000/batches/1/portion-diagnosis -H 'Content-Type: application/json' \
   -d '{"measurements": [{"sample_id": 1, "numerator": 1, "denominator": 1}], "max_portions": 10}'
+
+# 禁配补录预演：两个样本 id 相同 / 引用不存在的批次 / 引用混样批次 → 400
+curl -X POST http://localhost:8000/exclusion-rules/impact-preview -H 'Content-Type: application/json' \
+  -d '{"sample_a_id": 1, "sample_b_id": 1}'
+curl -X POST http://localhost:8000/exclusion-rules/impact-preview -H 'Content-Type: application/json' \
+  -d '{"sample_a_id": 1, "sample_b_id": 999}'
 ```
 
 ## 占比计算说明
@@ -376,12 +414,12 @@ pytest                                 # 运行测试（使用临时数据库，
 
 ```
 app/
-  main.py       # FastAPI 路由与请求处理（含禁配规则登记/查询、目标占比规划、配方变更预演、份数诊断端点）
+  main.py       # FastAPI 路由与请求处理（含禁配规则登记/查询、禁配补录影响预演、目标占比规划、配方变更预演、份数诊断端点）
   db.py         # SQLite 连接与建表（启动时自动执行，含禁配规则表与写事务设置）
   schemas.py    # Pydantic 请求/响应模型（含严格正整数校验）
-  service.py    # 递归占比计算、配方图可达原始样本、目标占比反算、配方预演与份数诊断（Fraction 精确分数）
+  service.py    # 递归占比计算、配方图可达原始样本、禁配补录影响预演、目标占比反算、配方预演与份数诊断（Fraction 精确分数）
 tests/
-  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数诊断、禁配规则、并发与各类非法输入）
+  test_api.py   # 端到端测试（含多级合并、约分、占比规划、配方预演、份数诊断、禁配规则、禁配补录影响预演、并发与各类非法输入）
 Dockerfile
 docker-compose.yml
 requirements.txt

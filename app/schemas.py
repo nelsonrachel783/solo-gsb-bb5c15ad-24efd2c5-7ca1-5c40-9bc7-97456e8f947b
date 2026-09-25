@@ -33,6 +33,27 @@ class ExclusionRuleOut(BaseModel):
     created_at: str
 
 
+class ExclusionImpactPreviewRequest(BaseModel):
+    """禁配补录影响预演：两个不同的原始样本 id；顺序无关，无需已登记为禁配对。"""
+
+    sample_a_id: StrictPositiveInt
+    sample_b_id: StrictPositiveInt
+
+
+class ExclusionImpactBatchOut(BaseModel):
+    batch_id: int
+    batch_name: BatchName
+    first_confluence: bool  # 直接原料均未同时含两样本：两样本在本批次首次合流
+    first_confluence_batch_ids: list[int]  # 可追溯的首次合流批次 id（含自身），升序去重
+
+
+class ExclusionImpactPreviewOut(BaseModel):
+    # 无序对归一后按 id 升序返回
+    low_sample_id: int
+    high_sample_id: int
+    affected_batches: list[ExclusionImpactBatchOut]  # 已同时含两样本的混样批次，按 id 升序
+
+
 class RecipeItem(BaseModel):
     batch_id: StrictPositiveInt
     portions: StrictPositiveInt

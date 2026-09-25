@@ -1007,3 +1007,176 @@ def test_portion_diagnosis_unknown_target_returns_404(client):
     s1 = make_sample(client, "S1")
     assert diagnose(client, 4242, measured((s1, 1, 1)), 10).status_code == 404
 
+
+# --------------------------------------------------------------------------- #
+# POST /exclusion-rules/impact-preview
+# --------------------------------------------------------------------------- #
+
+
+def impact_preview(client, a, b):
+    return client.post("/exclusion-rules/impact-preview", json={
+        "sample_a_id": a,
+        "sample_b_id": b,
+    })
+
+
+def test_impact_preview_basic_first_confluence(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    r = impact_preview(client, s1, s2)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "low_sample_id": s1,
+        "high_sample_id": s2,
+        "affected_batches": [
+            {"batch_id": p1, "batch_name": "P1", "first_confluence": True,
+             "first_confluence_batch_ids": [p1]},
+        ],
+    }
+
+
+def test_impact_preview_normalizes_pair_order(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    forward = impact_preview(client, s1, s2).json()
+    backward = impact_preview(client, s2, s1).json()
+    assert backward == forward
+    assert (forward["low_sample_id"], forward["high_sample_id"]) == (s1, s2)
+
+
+def test_impact_preview_nested_and_multi_path(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    # P1、P3 各自是两样本的首次合流；P2 经 P1 继承；P4 同时汇合 P2 与 P3
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    p2 = make_pool(client, "P2", [
+        {"batch_id": p1, "portions": 1}, {"batch_id": s3, "portions": 1}])
+    p3 = make_pool(client, "P3", [
+        {"batch_id": s1, "portions": 2}, {"batch_id": s2, "portions": 1}])
+    p4 = make_pool(client, "P4", [
+        {"batch_id": p2, "portions": 1}, {"batch_id": p3, "portions": 1}])
+    # 与两样本无关的批次不受影响
+    make_pool(client, "P5", [{"batch_id": s3, "portions": 1}])
+
+    r = impact_preview(client, s1, s2)
+    assert r.status_code == 200, r.text
+    assert r.json()["affected_batches"] == [
+        {"batch_id": p1, "batch_name": "P1", "first_confluence": True,
+         "first_confluence_batch_ids": [p1]},
+        {"batch_id": p2, "batch_name": "P2", "first_confluence": False,
+         "first_confluence_batch_ids": [p1]},
+        {"batch_id": p3, "batch_name": "P3", "first_confluence": True,
+         "first_confluence_batch_ids": [p3]},
+        {"batch_id": p4, "batch_name": "P4", "first_confluence": False,
+         "first_confluence_batch_ids": [p1, p3]},
+    ]
+
+
+def test_impact_preview_confluence_through_nested_ingredients(client):
+    # 两样本各自经嵌套混样到达 P：Q1 只含 S1、Q2 只含 S2，P 才是首次合流
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    q1 = make_pool(client, "Q1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s3, "portions": 1}])
+    q2 = make_pool(client, "Q2", [
+        {"batch_id": s2, "portions": 1}, {"batch_id": s3, "portions": 1}])
+    p = make_pool(client, "P", [
+        {"batch_id": q1, "portions": 1}, {"batch_id": q2, "portions": 1}])
+    r = impact_preview(client, s1, s2)
+    assert r.status_code == 200, r.text
+    assert r.json()["affected_batches"] == [
+        {"batch_id": p, "batch_name": "P", "first_confluence": True,
+         "first_confluence_batch_ids": [p]},
+    ]
+
+
+def test_impact_preview_diamond_dedupes_traceable_confluences(client):
+    # 菱形汇合：P3 经 P1、P2 两条路径到达同一首次合流 P1，可追溯列表不重复
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    p2 = make_pool(client, "P2", [{"batch_id": p1, "portions": 1}])
+    p3 = make_pool(client, "P3", [
+        {"batch_id": p1, "portions": 1}, {"batch_id": p2, "portions": 1}])
+    r = impact_preview(client, s1, s2)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [b["batch_id"] for b in body["affected_batches"]] == [p1, p2, p3]
+    assert body["affected_batches"][-1] == {
+        "batch_id": p3, "batch_name": "P3", "first_confluence": False,
+        "first_confluence_batch_ids": [p1],
+    }
+
+
+def test_impact_preview_no_affected_batches(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    s3 = make_sample(client, "S3")
+    # 两样本从未在同一批次中可达：结果为空
+    make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s3, "portions": 1}])
+    r = impact_preview(client, s1, s2)
+    assert r.status_code == 200, r.text
+    assert r.json() == {
+        "low_sample_id": s1, "high_sample_id": s2, "affected_batches": []}
+
+
+def test_impact_preview_allowed_unregistered_and_read_only(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    before_batches = client.get("/batches").json()
+    before_comp = fractions_of(client, p1)
+
+    # 尚未登记为禁配对也可预演
+    r = impact_preview(client, s1, s2)
+    assert r.status_code == 200, r.text
+    # 预演只读：不登记规则、不改已有批次与占比
+    assert client.get("/exclusion-rules").json() == []
+    assert client.get("/batches").json() == before_batches
+    assert fractions_of(client, p1) == before_comp
+
+    # 已登记的禁配对同样可预演，结果与登记前一致
+    assert add_rule(client, s1, s2).status_code == 201
+    assert impact_preview(client, s1, s2).json() == r.json()
+    assert client.get("/batches").json() == before_batches
+    assert fractions_of(client, p1) == before_comp
+
+
+def test_impact_preview_rejects_same_unknown_and_pool(client):
+    s1 = make_sample(client, "S1")
+    s2 = make_sample(client, "S2")
+    p1 = make_pool(client, "P1", [
+        {"batch_id": s1, "portions": 1}, {"batch_id": s2, "portions": 1}])
+    # 两个 id 相同 → 400
+    r = impact_preview(client, s1, s1)
+    assert r.status_code == 400
+    assert "不同" in r.json()["detail"]
+    # 未知 id → 400
+    r = impact_preview(client, s1, 999)
+    assert r.status_code == 400
+    assert "999" in r.json()["detail"]
+    # 混样批次不是原始样本 → 400
+    r = impact_preview(client, s1, p1)
+    assert r.status_code == 400
+    assert str(p1) in r.json()["detail"]
+    # 非法输入不得登记任何规则
+    assert client.get("/exclusion-rules").json() == []
+
+
+@pytest.mark.parametrize("bad", [0, -1, 1.5, 2.0, "1", True, None])
+def test_impact_preview_invalid_id_rejected(client, bad):
+    s1 = make_sample(client, "S1")
+    r = client.post("/exclusion-rules/impact-preview", json={
+        "sample_a_id": s1, "sample_b_id": bad})
+    assert r.status_code == 422
+

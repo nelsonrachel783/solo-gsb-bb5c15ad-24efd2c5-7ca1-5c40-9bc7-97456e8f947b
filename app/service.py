@@ -77,6 +77,54 @@ def reachable_samples(conn: sqlite3.Connection, ingredient_ids: list[int]) -> se
     return samples
 
 
+def exclusion_impact_preview(
+    conn: sqlite3.Connection, sample_a_id: int, sample_b_id: int
+) -> list[tuple[int, bool, list[int]]]:
+    """预演把两个原始样本补录为禁配对的影响：找出已同时含两者的混样批次。
+
+    沿配方 DAG 分别计算两个样本的可达性。批次只能引用更早创建的批次，
+    按 id 升序处理即为拓扑序，每个批次只展开一次：
+
+    - 受影响批次：同时可达两个样本的混样批次；
+    - 首次合流：受影响、但其直接原料均未同时含两样本的批次——两样本在此
+      首次汇合（可能各自经嵌套混样、多路径到达）；
+    - 每个受影响批次的可追溯首次合流：沿配方边向上可达的全部首次合流批次
+      （含自身，若自身是首次合流）；多路径汇合经集合合并去重，不漏报也不重复。
+
+    只读预演：不登记规则、不修改已有配方。
+    返回 [(批次 id, 是否首次合流, [可追溯首次合流批次 id])]，按批次 id 升序。
+    """
+    kinds, recipes = _load_graph(conn)
+
+    reach_a: dict[int, bool] = {}
+    reach_b: dict[int, bool] = {}
+    upstream_confluences: dict[int, set[int]] = {}
+    affected: list[tuple[int, bool, list[int]]] = []
+    for batch_id in sorted(kinds):
+        if kinds[batch_id] == "sample":
+            reach_a[batch_id] = batch_id == sample_a_id
+            reach_b[batch_id] = batch_id == sample_b_id
+            upstream_confluences[batch_id] = set()
+            continue
+        ingredients = [ingredient_id for ingredient_id, _ in recipes.get(batch_id, [])]
+        reach_a[batch_id] = any(reach_a[i] for i in ingredients)
+        reach_b[batch_id] = any(reach_b[i] for i in ingredients)
+        # 不含两样本的批次，其上游也不可能有首次合流（否则两样本必经其可达）
+        if not (reach_a[batch_id] and reach_b[batch_id]):
+            upstream_confluences[batch_id] = set()
+            continue
+        # 直接原料均未同时含两样本 → 两样本在本批次首次合流
+        first = not any(reach_a[i] and reach_b[i] for i in ingredients)
+        upstream: set[int] = set()
+        for i in ingredients:
+            upstream.update(upstream_confluences[i])
+        if first:
+            upstream.add(batch_id)
+        upstream_confluences[batch_id] = upstream
+        affected.append((batch_id, first, sorted(upstream)))
+    return affected
+
+
 def batch_composition(conn: sqlite3.Connection, batch_id: int) -> Composition:
     """递归展开批次，返回 {原始样本 id: 占比}。
 

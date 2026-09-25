@@ -3,6 +3,7 @@
 - POST /samples                        登记原始样本
 - POST /exclusion-rules                登记原始样本禁配对（无序对，重复登记幂等）
 - GET  /exclusion-rules                列出全部禁配规则
+- POST /exclusion-rules/impact-preview 禁配补录影响预演（只读：不登记规则、不改已有配方）
 - POST /pools                          创建混样批次（引用已有批次 + 正整数份数，命中禁配返回 409）
 - POST /pool-plans                     按目标占比反算整数份数配方（只规划，不创建批次）
 - GET  /batches                        列出全部批次
@@ -26,6 +27,9 @@ from .schemas import (
     BatchOut,
     ComponentOut,
     CompositionOut,
+    ExclusionImpactBatchOut,
+    ExclusionImpactPreviewOut,
+    ExclusionImpactPreviewRequest,
     ExclusionRuleCreate,
     ExclusionRuleOut,
     FractionOut,
@@ -46,6 +50,7 @@ from .schemas import (
 from .service import (
     PoolPlanError,
     batch_composition,
+    exclusion_impact_preview,
     pool_plan,
     portion_diagnosis,
     reachable_samples,
@@ -230,6 +235,65 @@ def create_exclusion_rule(
         low_sample_id=low_id,
         high_sample_id=high_id,
         created_at=row["created_at"],
+    )
+
+
+@app.post(
+    "/exclusion-rules/impact-preview",
+    response_model=ExclusionImpactPreviewOut,
+    summary="禁配补录影响预演（只读：不登记规则、不改已有配方）",
+)
+def preview_exclusion_impact(
+    payload: ExclusionImpactPreviewRequest,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> ExclusionImpactPreviewOut:
+    # 校验沿用 /exclusion-rules：两个不同、已存在的原始样本；顺序无关
+    low_id, high_id = sorted((payload.sample_a_id, payload.sample_b_id))
+    if low_id == high_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="两个原始样本 id 必须不同")
+
+    rows = {
+        r["id"]: r
+        for r in conn.execute(
+            "SELECT id, kind FROM batches WHERE id IN (?, ?)", (low_id, high_id)
+        )
+    }
+    missing = [i for i in (low_id, high_id) if i not in rows]
+    if missing:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=f"未知批次 id: {missing}")
+    not_samples = [i for i in (low_id, high_id) if rows[i]["kind"] != "sample"]
+    if not_samples:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"禁配对象必须是原始样本（kind='sample'）: {not_samples}",
+        )
+
+    # 纯读内存计算：不登记规则、不修改已有配方（该对无需已登记为禁配对）
+    affected = exclusion_impact_preview(conn, low_id, high_id)
+    names = (
+        {
+            r["id"]: r["name"]
+            for r in conn.execute(
+                "SELECT id, name FROM batches WHERE id IN (%s)"
+                % ", ".join("?" for _ in affected),
+                [batch_id for batch_id, _, _ in affected],
+            )
+        }
+        if affected
+        else {}
+    )
+    return ExclusionImpactPreviewOut(
+        low_sample_id=low_id,
+        high_sample_id=high_id,
+        affected_batches=[
+            ExclusionImpactBatchOut(
+                batch_id=batch_id,
+                batch_name=names[batch_id],
+                first_confluence=first_confluence,
+                first_confluence_batch_ids=traceable,
+            )
+            for batch_id, first_confluence, traceable in affected
+        ],
     )
 
 
